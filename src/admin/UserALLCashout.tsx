@@ -7,7 +7,7 @@ import React, {
   type FC,
 } from "react";
 import { ColumnDef } from "@tanstack/react-table";
-import { Clock } from "lucide-react";
+import { Clock, Trash2 } from "lucide-react";
 
 import { apiClient } from "../apiConfig";
 import { DataTable } from "../DataTable";
@@ -67,6 +67,7 @@ const UserAllCashoutTable: FC<UserCashoutTableProps> = ({ username }) => {
   const [rows, setRows] = useState<PendingRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const loadPending = useCallback(async () => {
     setLoading(true);
@@ -109,6 +110,29 @@ const UserAllCashoutTable: FC<UserCashoutTableProps> = ({ username }) => {
   useEffect(() => {
     void loadPending();
   }, [loadPending]);
+
+  const handleDelete = async (id: string) => {
+    if (!window.confirm("Delete this pending cashout?")) return;
+
+    try {
+      setDeletingId(id);
+      setError(null);
+
+      // Adjust URL if you choose a different backend route
+      await apiClient.delete(`/api/game-entries/pending/${id}`);
+
+      // Option A: remove from local state
+      setRows((prev) => prev.filter((r) => r._id !== id));
+
+      // Option B: reload from server instead:
+      // await loadPending();
+    } catch (err: any) {
+      console.error("Failed to delete pending cashout:", err);
+      setError("Failed to delete pending cashout.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const columns: ColumnDef<PendingRow>[] = useMemo(
     () => [
@@ -170,8 +194,28 @@ const UserAllCashoutTable: FC<UserCashoutTableProps> = ({ username }) => {
           </span>
         ),
       },
+      {
+        id: "actions",
+        header: "Actions",
+        cell: ({ row }) => {
+          const id = row.original._id;
+          const isDeleting = deletingId === id;
+
+          return (
+            <button
+              type="button"
+              onClick={() => void handleDelete(id)}
+              disabled={isDeleting}
+              className="inline-flex items-center px-2 py-1 text-xs rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50"
+            >
+              <Trash2 className="w-3 h-3 mr-1" />
+              {isDeleting ? "Deleting..." : "Delete"}
+            </button>
+          );
+        },
+      },
     ],
-    []
+    [deletingId]
   );
 
   return (
@@ -194,7 +238,6 @@ const UserAllCashoutTable: FC<UserCashoutTableProps> = ({ username }) => {
         </div>
       )}
 
-      {/* ⚠️ If your DataTable takes extra props (isLoading, emptyMessage), add them here */}
       <DataTable columns={columns} data={rows} />
       {rows.length === 0 && !loading && !error && (
         <p className="text-xs text-muted-foreground mt-2">

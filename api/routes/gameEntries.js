@@ -1155,6 +1155,54 @@ router.put("/:id", async (req, res) => {
 });
 
 /**
+ * 🔹 DELETE /api/game-entries/pending/:id
+ * Deletes a single pending cashout entry (redeem/deposit) and reverses
+ * its effect from Game.totalCoins, same as the generic delete.
+ *
+ * Used by the UserCashoutTable "Delete" action.
+ */
+router.delete("/pending/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const entry = await GameEntry.findById(id);
+    if (!entry) {
+      return res.status(404).json({ message: "Pending entry not found" });
+    }
+
+    // Optional: enforce only pending items can be deleted
+    const isPendingEntry =
+      entry.isPending ||
+      toNumber(entry.reduction, 0) > 0 ||
+      toNumber(entry.remainingPay, 0) > 0;
+
+    if (!isPendingEntry) {
+      return res
+        .status(400)
+        .json({
+          message: "This game entry is not pending and cannot be deleted here",
+        });
+    }
+
+    // ⭐ reverse its effect from totalCoins before delete
+    const delta = coinEffect(entry.type, entry.amountFinal);
+    if (delta !== 0) {
+      await applyGameDelta(entry.gameName, -delta);
+    }
+
+    await recordHistory(entry, "delete-pending");
+    await entry.deleteOne();
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ DELETE /api/game-entries/pending/:id error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to delete pending game entry" });
+  }
+});
+
+/**
  * 🔹 DELETE /api/game-entries/:id
  * (also reverses its effect from Game.totalCoins)
  */
