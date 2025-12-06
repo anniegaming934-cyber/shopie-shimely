@@ -42,6 +42,10 @@ app.use(
 
 // ✅ JSON
 app.use(express.json());
+app.use((req, _res, next) => {
+  console.log("Origin:", req.headers.origin);
+  next();
+});
 
 // ✅ Log requests
 app.use((req, _res, next) => {
