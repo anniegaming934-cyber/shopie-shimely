@@ -8,9 +8,13 @@ import GameRechargeHistory from "./GameRechargeHistory";
 export interface GameRowDT {
   id: number;
   name: string;
-  coinsRecharged: number; // coins you bought / loaded
+  // from backend: total coin recharged (sum of deposits for this game, optional month filter)
+  totalRecharged?: number;
+  // manual/base field from Game model (what you set on edit)
+  coinsRecharged: number;
   lastRechargeDate?: string;
-  totalCoins?: number; // net coins from backend (profit/loss in coins)
+  // net coins from backend (already computed according to your per-day, per-username rule)
+  totalCoins?: number;
 }
 
 // helper to show "Today / Yesterday / X days ago"
@@ -39,15 +43,41 @@ export const makeGameColumns = (coinValue: number): ColumnDef<GameRowDT>[] => [
       </div>
     ),
   },
+
+  // 1️⃣ Coin Recharged (from Game.coinsRecharged)
   {
     header: "Coin Recharged",
     accessorKey: "coinsRecharged",
-    cell: ({ getValue }) => (
-      <span className="font-mono text-blue-700">
-        {Number(getValue() || 0).toLocaleString()}
-      </span>
-    ),
+    cell: ({ row }) => {
+      const value =
+        typeof row.original.coinsRecharged === "number"
+          ? row.original.coinsRecharged
+          : 0;
+      return (
+        <span className="font-mono text-blue-700">
+          {value.toLocaleString()}
+        </span>
+      );
+    },
   },
+
+  // 2️⃣ Total Coin Recharged (sum of deposits from history)
+  {
+    header: "Total Coin Recharged",
+    accessorKey: "totalRecharged",
+    cell: ({ row }) => {
+      const value =
+        typeof row.original.totalRecharged === "number"
+          ? row.original.totalRecharged
+          : 0;
+      return (
+        <span className="font-mono text-indigo-700">
+          {value.toLocaleString()}
+        </span>
+      );
+    },
+  },
+
   {
     header: "Last Recharged",
     accessorKey: "lastRechargeDate",
@@ -66,18 +96,17 @@ export const makeGameColumns = (coinValue: number): ColumnDef<GameRowDT>[] => [
     },
   },
 
-  // TOTAL COIN (per game net) = coinsRecharged + backend totalCoins
+  // TOTAL COIN (per game net) = backend totalCoins (already includes your logic)
   {
     header: "Total coin (per game net)",
     id: "totalCoin",
     cell: ({ row }) => {
       const g = row.original;
 
-      const recharged = g.coinsRecharged || 0;
-      const netFromBackend =
+      // backend already calculated this based on:
+      //   coinsRecharged + (redeem - deposit - freeplay) per day per user
+      const totalForDisplay =
         typeof g.totalCoins === "number" ? g.totalCoins : 0;
-
-      const totalForDisplay = recharged + netFromBackend;
 
       const cls =
         totalForDisplay > 0
