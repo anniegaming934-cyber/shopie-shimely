@@ -5,7 +5,7 @@ import User from "../models/User.js";
 import LoginSession from "../models/LoginSession.js";
 import GameEntry from "../models/GameEntry.js";
 import { requireAuth, requireAdmin } from "./auth.js";
-import DeletedUsername from "../models/DeletedUsername.js"; // NEW
+import DeletedUsername from "../models/DeletedUsername.js";
 
 const router = express.Router();
 
@@ -13,10 +13,14 @@ const router = express.Router();
  * GET /api/admin/users
  * Optional: ?status=pending | active | blocked
  *
- * Option B behavior:
- *  - Load ALL users for auto-create logic (usernames + emails)
- *  - Collect all usernames from GameEntry (username or createdBy)
- *  - Auto-create missing User rows with UNIQUE placeholder email/password
+ * Behavior:
+ *  - Load ALL users for auto-create dedupe logic (usernames + emails)
+ *  - Collect usernames from:
+ *      a) LoginSession (username + real email)
+ *      b) GameEntry (username or createdBy)
+ *  - Auto-create missing User rows:
+ *      - from LoginSession → use REAL email from session
+ *      - from GameEntry → use UNIQUE placeholder email @noemail.local
  *  - Then load filtered users (baseUserQuery) for the response
  */
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
@@ -52,14 +56,97 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     );
 
     // 1b) Load usernames that were explicitly deleted/ignored
-    const deletedRows = await DeletedUsername.find({}, "username").lean(); // NEW
+    const deletedRows = await DeletedUsername.find({}, "username").lean();
     const deletedUsernameSet = new Set(
       deletedRows
         .map((d) => (d.username ? String(d.username).trim() : ""))
         .filter(Boolean)
     );
 
-    // 2) usernames from GameEntry
+    // 2a) usernames + real emails from LoginSession
+    const loginAgg = await LoginSession.aggregate([
+      {
+        $match: {
+          username: { $ne: null, $ne: "" },
+          email: { $ne: null, $ne: "" },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            username: { $trim: { input: "$username" } },
+            email: {
+              $toLower: {
+                $trim: { input: "$email" },
+              },
+            },
+          },
+        },
+      },
+    ]);
+
+    const loginUsers = loginAgg
+      .map((row) => {
+        const u = row._id?.username || "";
+        const e = row._id?.email || "";
+        return {
+          username: String(u).trim(),
+          email: String(e).trim(),
+        };
+      })
+      .filter((x) => x.username && x.email);
+
+    // 2a.1) auto-create missing users from LoginSession with REAL email
+    const loginDocsToInsert = [];
+
+    for (const { username, email } of loginUsers) {
+      if (!username || !email) continue;
+
+      const cleanU = username.trim();
+      const cleanE = email.trim().toLowerCase();
+
+      if (!cleanU || !cleanE) continue;
+
+      // skip if username already exists or is ignored
+      if (realUsernameSet.has(cleanU) || deletedUsernameSet.has(cleanU)) {
+        continue;
+      }
+
+      // skip if this email is already used in User
+      if (existingEmails.has(cleanE)) {
+        continue;
+      }
+
+      existingEmails.add(cleanE);
+      realUsernameSet.add(cleanU); // so GameEntry step doesn't re-create
+
+      loginDocsToInsert.push({
+        username: cleanU,
+        email: cleanE,
+        passwordHash: "no-password",
+        role: "user",
+        isAdmin: false,
+        isApproved: false,
+        status: "pending",
+        totalPayments: 0,
+        totalFreeplay: 0,
+        totalDeposit: 0,
+        totalRedeem: 0,
+      });
+    }
+
+    if (loginDocsToInsert.length > 0) {
+      try {
+        await User.insertMany(loginDocsToInsert, { ordered: false });
+      } catch (insertErr) {
+        console.error(
+          "Error auto-creating users from LoginSession:",
+          insertErr
+        );
+      }
+    }
+
+    // 2b) usernames from GameEntry (fallback: no real email → placeholder)
     const gameUserAgg = await GameEntry.aggregate([
       {
         $project: {
@@ -95,16 +182,14 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       .map((row) => (row._id ? String(row._id).trim() : ""))
       .filter(Boolean);
 
-    // de-duplicate game usernames
     const uniqueGameUsernames = [...new Set(gameUsernames)];
 
-    // 3) which game usernames are missing in User collection
-    //    AND not in DeletedUsername
+    // 3) which game usernames are missing in User collection AND not deleted
     const missingUsernames = uniqueGameUsernames.filter(
       (uname) => !realUsernameSet.has(uname) && !deletedUsernameSet.has(uname)
     );
 
-    // 4) auto-create missing users (placeholder) with UNIQUE placeholder emails
+    // 4) auto-create missing users (placeholder) with UNIQUE @noemail.local
     if (missingUsernames.length > 0) {
       const docsToInsert = [];
 
@@ -116,7 +201,6 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         let candidate = `${baseLocal}@noemail.local`;
         let counter = 1;
 
-        // ensure placeholder email is unique across ALL users
         while (existingEmails.has(candidate)) {
           candidate = `${baseLocal}+${counter}@noemail.local`;
           counter += 1;
@@ -142,7 +226,6 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         try {
           await User.insertMany(docsToInsert, { ordered: false });
         } catch (insertErr) {
-          // if some race or rare duplicate happens, just log and continue
           console.error("Error auto-creating users from GameEntry:", insertErr);
         }
       }
@@ -221,7 +304,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       };
     }
 
-    // 8) latest login sessions
+    // 8) latest login sessions (for lastSignIn/Out)
     const sessionsAgg = await LoginSession.aggregate([
       {
         $match: {
@@ -246,7 +329,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
       };
     }
 
-    // 9) merge
+    // 9) merge into response
     const enhanced = users.map((u) => {
       const base = { ...u };
 
@@ -301,7 +384,7 @@ router.get("/approved-basic", requireAuth, requireAdmin, async (req, res) => {
         $or: [{ isApproved: true }, { status: "active" }],
         email: {
           $ne: null,
-          $not: /@noemail\.local$/i, // exclude placeholder emails
+          $not: /@noemail\.local$/i,
         },
       },
       "username email createdAt"
@@ -320,7 +403,6 @@ router.get("/approved-basic", requireAuth, requireAdmin, async (req, res) => {
 
       const emailKey = email.toLowerCase();
       if (seenEmails.has(emailKey)) {
-        // skip duplicate email rows
         continue;
       }
       seenEmails.add(emailKey);
@@ -375,11 +457,6 @@ router.get(
 /**
  * PATCH /api/admin/users/:id/approve
  * Body (optional): { email: "real@gmail.com" }
- *
- * When approving:
- *  - sets isApproved=true and status="active"
- *  - optionally updates email if provided in body
- *  - creates a login session
  */
 router.patch("/:id/approve", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -403,7 +480,6 @@ router.patch("/:id/approve", requireAuth, requireAdmin, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // optional: this creates a login session when approved
     await LoginSession.create({
       username: user.username,
       email: user.email,
@@ -459,14 +535,12 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // "virtual:<username>" rows (no User document)
     if (id.startsWith("virtual:")) {
       const username = id.slice("virtual:".length).trim();
       if (!username) {
         return res.status(400).json({ message: "Invalid virtual user id" });
       }
 
-      // remember username so we don't auto-create it again
       await DeletedUsername.updateOne(
         { username },
         { $set: { username } },
@@ -480,12 +554,10 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
       });
     }
 
-    // guard against invalid ObjectId
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid user id" });
     }
 
-    // normal delete for real User documents
     const user = await User.findById(id);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -494,7 +566,6 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     const username = user.username ? String(user.username).trim() : "";
 
     if (username) {
-      // remember username so we don't auto-create it again
       await DeletedUsername.updateOne(
         { username },
         { $set: { username } },
