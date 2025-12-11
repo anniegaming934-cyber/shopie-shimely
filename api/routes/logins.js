@@ -63,7 +63,9 @@ router.post("/start", async (req, res) => {
     }
 
     // 2️⃣ Check approval status
-    if (user.status !== "approved") {
+    //    You are using: status = pending | active | blocked, plus isApproved flag
+    const isApprovedUser = user.isApproved === true || user.status === "active";
+    if (!isApprovedUser) {
       return res.status(403).json({
         message: "User is not approved yet. Login will not be recorded.",
       });
@@ -72,7 +74,8 @@ router.post("/start", async (req, res) => {
     // 3️⃣ Only approved users reach here ⇒ create session
     const session = await LoginSession.create({
       username,
-      email: email || null, // store email also
+      // Prefer email from body, otherwise use User.email so it matches adminUsers.js logic
+      email: email || user.email || null,
       signInAt: signInAt ? new Date(signInAt) : new Date(),
     });
 
@@ -121,7 +124,7 @@ router.post("/end", async (req, res) => {
  *   ?latest=1         -> only latest session
  * Returns ONLY:
  *   - sessions with username + email present
- *   - AND whose user is approved
+ *   - AND whose user is approved (same rule as adminUsers)
  */
 router.get("/", async (req, res) => {
   try {
@@ -134,7 +137,6 @@ router.get("/", async (req, res) => {
     };
 
     if (username && typeof username === "string") {
-      // if username is provided, override username filter with exact match
       filter.username = username;
     }
 
@@ -153,7 +155,7 @@ router.get("/", async (req, res) => {
 
     const approvedUsers = await User.find({
       username: { $in: usernames },
-      status: "approved", // adjust if you use a different field/value
+      $or: [{ isApproved: true }, { status: "active" }],
     }).lean();
 
     const approvedSet = new Set(approvedUsers.map((u) => u.username));
@@ -184,7 +186,7 @@ router.get("/", async (req, res) => {
  * 🧾 GET /api/logins/:username
  * Returns only the *latest* session for this user
  * AND only if:
- *   - user is approved
+ *   - user is approved (same rule as above)
  *   - session has email
  */
 router.get("/:username", async (req, res) => {
@@ -200,7 +202,9 @@ router.get("/:username", async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
-    if (user.status !== "approved") {
+
+    const isApprovedUser = user.isApproved === true || user.status === "active";
+    if (!isApprovedUser) {
       return res.status(403).json({
         message: "User is not approved. No login sessions available.",
       });
