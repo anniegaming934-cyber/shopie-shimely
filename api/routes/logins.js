@@ -2,7 +2,7 @@
 import express from "express";
 import { connectDB } from "../config/db.js";
 import LoginSession from "../models/LoginSession.js";
-import User from "../models/User.js"; // 👈 adjust path/name if needed
+import User from "../models/User.js";
 
 const router = express.Router();
 
@@ -22,7 +22,7 @@ function formatSession(s) {
   const signIn = s.signInAt ? new Date(s.signInAt).toISOString() : null;
   const signOut = s.signOutAt ? new Date(s.signOutAt).toISOString() : null;
 
-  const isOnline = signIn && !signOut; // 👈 ONLINE condition
+  const isOnline = signIn && !signOut;
 
   return {
     _id: String(s._id),
@@ -43,46 +43,64 @@ function formatSession(s) {
 }
 
 /**
+ * ✅ GET /api/logins/ping
+ * Quick deployment check (remove later if you want)
+ */
+router.get("/ping", (_req, res) => {
+  res.json({ ok: true });
+});
+
+/**
  * 🟢 POST /api/logins/start
- * Body: { username, email?, signInAt }
- * Only records login if user is approved.
+ * Body: { email, signInAt? }
+ * Records login ONLY if user is approved.
+ * Uses canonical username/email from User document.
  */
 router.post("/start", async (req, res) => {
   try {
-    const { username, email, signInAt } = req.body;
+    const { email, signInAt } = req.body;
 
-    if (!username || typeof username !== "string") {
-      return res.status(400).json({ message: "username is required" });
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ message: "email is required" });
     }
 
-    // 1️⃣ Find the user
-    const user = await User.findOne({ username }).lean();
+    // Keep case as-is (your system is case-sensitive)
+    const rawEmail = email.trim();
+
+    // 1️⃣ Find the user by EMAIL (matches your frontend login)
+    const user = await User.findOne({ email: rawEmail }).lean();
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
     // 2️⃣ Check approval status
-    //    You are using: status = pending | active | blocked, plus isApproved flag
     const isApprovedUser = user.isApproved === true || user.status === "active";
     if (!isApprovedUser) {
       return res.status(403).json({
         message: "User is not approved yet. Login will not be recorded.",
+        code: "NOT_APPROVED",
       });
     }
 
-    // 3️⃣ Only approved users reach here ⇒ create session
+    if (user.status === "blocked") {
+      return res.status(403).json({
+        message: "User is blocked. Login will not be recorded.",
+        code: "BLOCKED",
+      });
+    }
+
+    // 3️⃣ Create session with canonical values from DB
     const session = await LoginSession.create({
-      username,
-      // Prefer email from body, otherwise use User.email so it matches adminUsers.js logic
-      email: email || user.email || null,
+      username: user.username, // ✅ always DB username
+      email: user.email, // ✅ always DB email
       signInAt: signInAt ? new Date(signInAt) : new Date(),
     });
 
-    res.status(201).json(formatSession(session));
+    return res.status(201).json(formatSession(session));
   } catch (err) {
     console.error("Error in POST /api/logins/start:", err);
-    res
+    return res
       .status(500)
       .json({ message: "Failed to start session", error: err.message });
   }
@@ -90,7 +108,7 @@ router.post("/start", async (req, res) => {
 
 /**
  * 🔴 POST /api/logins/end
- * Body: { sessionId, signOutAt }
+ * Body: { sessionId, signOutAt? }
  */
 router.post("/end", async (req, res) => {
   try {
@@ -111,7 +129,7 @@ router.post("/end", async (req, res) => {
     return res.json(formatSession(session));
   } catch (err) {
     console.error("Error in POST /api/logins/end:", err);
-    res
+    return res
       .status(500)
       .json({ message: "Failed to end session", error: err.message });
   }
@@ -120,17 +138,17 @@ router.post("/end", async (req, res) => {
 /**
  * 🧾 GET /api/logins
  * Optional:
- *   ?username=foo     -> filter by username
- *   ?latest=1         -> only latest session
- * Returns ONLY:
- *   - sessions with username + email present
- *   - AND whose user is approved (same rule as adminUsers)
+ *   ?username=foo  -> filter by username
+ *   ?latest=1      -> only latest session
+ *
+ * Returns only:
+ *  - sessions with username + email present
+ *  - sessions whose user is approved
  */
 router.get("/", async (req, res) => {
   try {
     const { username, latest } = req.query;
 
-    // base filter: must have username + email
     const filter = {
       username: { $exists: true, $ne: "" },
       email: { $exists: true, $ne: null },
@@ -142,15 +160,11 @@ router.get("/", async (req, res) => {
 
     let query = LoginSession.find(filter).sort({ signInAt: -1 });
 
-    if (latest === "1" || latest === "true") {
-      query = query.limit(1);
-    } else {
-      query = query.limit(200);
-    }
+    if (latest === "1" || latest === "true") query = query.limit(1);
+    else query = query.limit(200);
 
     const sessions = await query.lean();
 
-    // 🔎 keep only sessions whose user is approved
     const usernames = [...new Set(sessions.map((s) => s.username))];
 
     const approvedUsers = await User.find({
@@ -164,19 +178,10 @@ router.get("/", async (req, res) => {
       .filter((s) => approvedSet.has(s.username))
       .map(formatSession);
 
-    console.log(
-      "📜 GET /api/logins => filter:",
-      filter,
-      "total:",
-      sessions.length,
-      "approved+hasEmail:",
-      approvedSessions.length
-    );
-
-    res.json(approvedSessions);
+    return res.json(approvedSessions);
   } catch (err) {
     console.error("Error in GET /api/logins:", err);
-    res
+    return res
       .status(500)
       .json({ message: "Failed to load sessions", error: err.message });
   }
@@ -184,10 +189,8 @@ router.get("/", async (req, res) => {
 
 /**
  * 🧾 GET /api/logins/:username
- * Returns only the *latest* session for this user
- * AND only if:
- *   - user is approved (same rule as above)
- *   - session has email
+ * Returns only the latest session for this user,
+ * only if user is approved and session has email.
  */
 router.get("/:username", async (req, res) => {
   try {
@@ -197,7 +200,6 @@ router.get("/:username", async (req, res) => {
       return res.status(400).json({ message: "username is required" });
     }
 
-    // Check user is approved first
     const user = await User.findOne({ username }).lean();
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -212,7 +214,7 @@ router.get("/:username", async (req, res) => {
 
     const session = await LoginSession.findOne({
       username,
-      email: { $exists: true, $ne: null }, // must have email
+      email: { $exists: true, $ne: null },
     })
       .sort({ signInAt: -1 })
       .lean();
@@ -223,10 +225,10 @@ router.get("/:username", async (req, res) => {
       });
     }
 
-    res.json(formatSession(session));
+    return res.json(formatSession(session));
   } catch (err) {
     console.error("Error in GET /api/logins/:username:", err);
-    res.status(500).json({
+    return res.status(500).json({
       message: "Failed to load user session",
       error: err.message,
     });
@@ -235,7 +237,6 @@ router.get("/:username", async (req, res) => {
 
 /**
  * 🗑️ DELETE /api/logins/user/:username
- * Delete all login records for this user
  */
 router.delete("/user/:username", async (req, res) => {
   try {
@@ -246,14 +247,14 @@ router.delete("/user/:username", async (req, res) => {
 
     const result = await LoginSession.deleteMany({ username });
 
-    res.json({
+    return res.json({
       message: "User login activity deleted",
       username,
       deletedCount: result.deletedCount,
     });
   } catch (err) {
     console.error("Error deleting user login activity:", err);
-    res.status(500).json({
+    return res.status(500).json({
       message: "Failed to delete user login activity",
       error: err.message,
     });
