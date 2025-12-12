@@ -13,24 +13,17 @@ const router = express.Router();
  * GET /api/admin/users
  * Optional: ?status=pending | active | blocked
  *
- * Behavior:
- *  - Load ALL users for auto-create dedupe logic (usernames + emails)
- *  - Collect usernames from:
- *      a) LoginSession (username + real email)
- *      b) GameEntry (username or createdBy)
- *  - Auto-create missing User rows:
- *      - from LoginSession → use REAL email from session
- *      - from GameEntry → use UNIQUE placeholder email @noemail.local
- *  - Then load filtered users (baseUserQuery) for the response
+ * Updates:
+ *  ✅ Do NOT auto-create users from LoginSession (sessions are not a source of truth)
+ *  ✅ GameEntry.username is REQUIRED in schema → never use createdBy as fallback
+ *  ✅ Totals aggregation uses ONLY GameEntry.username (not createdBy)
  */
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { status } = req.query;
 
     const baseUserQuery = {};
-    if (status) {
-      baseUserQuery.status = status;
-    }
+    if (status) baseUserQuery.status = status;
 
     // Helper: load users for the RESPONSE (respect status filter)
     const loadUsersForResponse = async () =>
@@ -63,117 +56,21 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         .filter(Boolean)
     );
 
-    // 2a) usernames + real emails from LoginSession
-    const loginAgg = await LoginSession.aggregate([
+    // ------------------------------------------------------------
+    // ✅ REMOVED: auto-create from LoginSession
+    // (LoginSession should not create new User rows)
+    // ------------------------------------------------------------
+
+    // 2) Usernames from GameEntry (username is REQUIRED, so NO createdBy fallback)
+    const gameUserAgg = await GameEntry.aggregate([
       {
         $match: {
           username: { $ne: null, $ne: "" },
-          email: { $ne: null, $ne: "" },
         },
       },
       {
         $group: {
-          _id: {
-            username: { $trim: { input: "$username" } },
-            email: {
-              $toLower: {
-                $trim: { input: "$email" },
-              },
-            },
-          },
-        },
-      },
-    ]);
-
-    const loginUsers = loginAgg
-      .map((row) => {
-        const u = row._id?.username || "";
-        const e = row._id?.email || "";
-        return {
-          username: String(u).trim(),
-          email: String(e).trim(),
-        };
-      })
-      .filter((x) => x.username && x.email);
-
-    // 2a.1) auto-create missing users from LoginSession with REAL email
-    const loginDocsToInsert = [];
-
-    for (const { username, email } of loginUsers) {
-      if (!username || !email) continue;
-
-      const cleanU = username.trim();
-      const cleanE = email.trim().toLowerCase();
-
-      if (!cleanU || !cleanE) continue;
-
-      // skip if username already exists or is ignored
-      if (realUsernameSet.has(cleanU) || deletedUsernameSet.has(cleanU)) {
-        continue;
-      }
-
-      // skip if this email is already used in User
-      if (existingEmails.has(cleanE)) {
-        continue;
-      }
-
-      existingEmails.add(cleanE);
-      realUsernameSet.add(cleanU); // so GameEntry step doesn't re-create
-
-      loginDocsToInsert.push({
-        username: cleanU,
-        email: cleanE,
-        passwordHash: "no-password",
-        role: "user",
-        isAdmin: false,
-        isApproved: false,
-        status: "pending",
-        totalPayments: 0,
-        totalFreeplay: 0,
-        totalDeposit: 0,
-        totalRedeem: 0,
-      });
-    }
-
-    if (loginDocsToInsert.length > 0) {
-      try {
-        await User.insertMany(loginDocsToInsert, { ordered: false });
-      } catch (insertErr) {
-        console.error(
-          "Error auto-creating users from LoginSession:",
-          insertErr
-        );
-      }
-    }
-
-    // 2b) usernames from GameEntry (fallback: no real email → placeholder)
-    const gameUserAgg = await GameEntry.aggregate([
-      {
-        $project: {
-          effectiveUsername: {
-            $cond: [
-              {
-                $and: [
-                  { $ne: ["$username", null] },
-                  { $ne: ["$username", ""] },
-                ],
-              },
-              "$username",
-              "$createdBy",
-            ],
-          },
-        },
-      },
-      {
-        $match: {
-          effectiveUsername: { $ne: null },
-        },
-      },
-      {
-        $group: {
-          _id: {
-            $trim: { input: "$effectiveUsername" },
-          },
+          _id: { $trim: { input: "$username" } },
         },
       },
     ]);
@@ -233,36 +130,23 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
 
     // 5) Now load users for the RESPONSE (respecting ?status=...)
     let users = await loadUsersForResponse();
-
-    if (!users.length) {
-      return res.json([]);
-    }
+    if (!users.length) return res.json([]);
 
     // 6) username list from filtered users
     const usernames = users
       .map((u) => (u.username ? String(u.username).trim() : ""))
       .filter(Boolean);
 
-    // 7) totals from GameEntry
+    // 7) totals from GameEntry (ONLY username)
     const totalsAgg = await GameEntry.aggregate([
       {
         $match: {
-          $or: [
-            { username: { $in: usernames } },
-            { createdBy: { $in: usernames } },
-          ],
-        },
-      },
-      {
-        $addFields: {
-          effectiveUsername: {
-            $ifNull: ["$username", "$createdBy"],
-          },
+          username: { $in: usernames },
         },
       },
       {
         $group: {
-          _id: "$effectiveUsername",
+          _id: "$username",
           totalDeposit: {
             $sum: {
               $cond: [
@@ -402,9 +286,8 @@ router.get("/approved-basic", requireAuth, requireAdmin, async (req, res) => {
       if (!username || !email) continue;
 
       const emailKey = email.toLowerCase();
-      if (seenEmails.has(emailKey)) {
-        continue;
-      }
+      if (seenEmails.has(emailKey)) continue;
+
       seenEmails.add(emailKey);
 
       result.push({
@@ -433,9 +316,8 @@ router.get(
   async (req, res) => {
     try {
       const username = String(req.params.username || "").trim();
-      if (!username) {
+      if (!username)
         return res.status(400).json({ message: "username is required" });
-      }
 
       const entries = await GameEntry.find({ username })
         .sort({ createdAt: -1 })
@@ -476,9 +358,7 @@ router.patch("/:id/approve", requireAuth, requireAdmin, async (req, res) => {
       new: true,
     });
 
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
     await LoginSession.create({
       username: user.username,
@@ -503,16 +383,11 @@ router.patch("/:id/block", requireAuth, requireAdmin, async (req, res) => {
 
     const user = await User.findByIdAndUpdate(
       id,
-      {
-        isApproved: false,
-        status: "blocked",
-      },
+      { isApproved: false, status: "blocked" },
       { new: true }
     ).select("username email role isAdmin isApproved status createdAt");
 
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
     return res.json({
       message: "User blocked successfully",
@@ -537,9 +412,8 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
 
     if (id.startsWith("virtual:")) {
       const username = id.slice("virtual:".length).trim();
-      if (!username) {
+      if (!username)
         return res.status(400).json({ message: "Invalid virtual user id" });
-      }
 
       await DeletedUsername.updateOne(
         { username },
@@ -559,9 +433,7 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
     }
 
     const user = await User.findById(id);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
     const username = user.username ? String(user.username).trim() : "";
 

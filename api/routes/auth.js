@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 import User from "../models/User.js";
+import LoginSession from "../models/LoginSession.js";
 import { ensureAdminUser } from "../utils/admin.js";
 import { connectDB } from "../config/db.js";
 
@@ -46,7 +47,7 @@ async function requireAuth(req, res, next) {
     let payload;
     try {
       payload = jwt.verify(token, JWT_SECRET);
-    } catch (err) {
+    } catch (_err) {
       return res.status(401).json({ message: "Invalid token" });
     }
 
@@ -77,6 +78,21 @@ function requireAdmin(req, res, next) {
     return res.status(403).json({ message: "Admin access required" });
   }
   next();
+}
+
+// ✅ helper: record a login session (username + email ALWAYS from DB)
+async function createLoginSessionForUser(user) {
+  try {
+    const username = user.username || user.name || user.email.split("@")[0];
+
+    await LoginSession.create({
+      username,
+      email: user.email,
+      signInAt: new Date(),
+    });
+  } catch (err) {
+    console.error("⚠️ LoginSession create failed:", err?.message || err);
+  }
 }
 
 // POST /api/auth/register
@@ -129,26 +145,26 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// POST /api/auth/login
+// POST /api/auth/login  ✅ APPROVED-ONLY + LOGIN SESSION
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
 
-    // 🔹 Same: trim only, keep case
+    // 🔹 Trim only, keep case
     const rawEmail = (email || "").trim();
 
     if (!rawEmail || !password) {
       return res.status(400).json({ message: "Email and password required" });
     }
 
-    // 🔥 CASE-SENSITIVE lookup: Mongo string match is case-sensitive by default
+    // 🔥 CASE-SENSITIVE lookup
     const user = await User.findOne({ email: rawEmail });
 
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    // (Optional extra strict check – redundant, but explicit)
+    // Explicit case-match message (your frontend uses this)
     if (user.email !== rawEmail) {
       return res
         .status(401)
@@ -160,18 +176,20 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    // ⭐ ADMIN VERIFICATION CHECK
-    // Backwards compatible: if isApproved is undefined, don't block
-    if (user.role === "user" && user.isApproved === false) {
-      return res.status(403).json({
-        message: "Your account is pending admin approval.",
-        code: "NOT_APPROVED",
-      });
-    }
+    // 🚫 Blocked users cannot login
     if (user.status === "blocked") {
       return res.status(403).json({
         message: "Your account has been blocked. Please contact admin.",
         code: "BLOCKED",
+      });
+    }
+
+    // ✅ Approved-only login (same rule as your logins.js)
+    const isApprovedUser = user.isApproved === true || user.status === "active";
+    if (!isApprovedUser) {
+      return res.status(403).json({
+        message: "Your account is pending admin approval.",
+        code: "NOT_APPROVED",
       });
     }
 
@@ -185,6 +203,9 @@ router.post("/login", async (req, res) => {
     const token = jwt.sign(payload, JWT_SECRET, {
       expiresIn: "7d",
     });
+
+    // ✅ Record session (username+email from DB only)
+    await createLoginSessionForUser(user);
 
     res.json({
       message: "Login successful",
