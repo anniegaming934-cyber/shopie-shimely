@@ -1,6 +1,5 @@
 // routes/adminUsers.js
 import express from "express";
-import mongoose from "mongoose";
 import User from "../models/User.js";
 import LoginSession from "../models/LoginSession.js";
 import GameEntry from "../models/GameEntry.js";
@@ -13,10 +12,11 @@ const router = express.Router();
  * GET /api/admin/users
  * Optional: ?status=pending | active | blocked
  *
- * Updates:
- *  ✅ Do NOT auto-create users from LoginSession (sessions are not a source of truth)
- *  ✅ GameEntry.username is REQUIRED in schema → never use createdBy as fallback
- *  ✅ Totals aggregation uses ONLY GameEntry.username (not createdBy)
+ * Update:
+ * ✅ Only create "virtual" users from GameEntry.username
+ * ✅ NEVER create users from LoginSession
+ * ✅ NEVER use createdBy for usernames/totals
+ * ✅ Hide virtual users when ?status=active (so approved list stays clean)
  */
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -25,7 +25,14 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     const baseUserQuery = {};
     if (status) baseUserQuery.status = status;
 
-    // Helper: load users for the RESPONSE (respect status filter)
+    // If admin is viewing ACTIVE users, exclude virtual placeholder emails automatically
+    const excludeVirtualForActive =
+      status === "active" || status === "blocked" || status === "pending";
+
+    if (excludeVirtualForActive && status === "active") {
+      baseUserQuery.email = { $not: /@noemail\.local$/i };
+    }
+
     const loadUsersForResponse = async () =>
       User.find(
         baseUserQuery,
@@ -34,13 +41,14 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         .sort({ createdAt: -1 })
         .lean();
 
-    // 1) Load ALL users (no status filter) for auto-create dedupe logic
+    // 1) Load ALL users for dedupe
     const allUsers = await User.find({}, "username email").lean();
 
-    const allUsernames = allUsers
-      .map((u) => (u.username ? String(u.username).trim() : ""))
-      .filter(Boolean);
-    const realUsernameSet = new Set(allUsernames);
+    const realUsernameSet = new Set(
+      allUsers
+        .map((u) => (u.username ? String(u.username).trim() : ""))
+        .filter(Boolean)
+    );
 
     const existingEmails = new Set(
       allUsers
@@ -48,7 +56,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         .filter(Boolean)
     );
 
-    // 1b) Load usernames that were explicitly deleted/ignored
+    // 2) Deleted usernames (ignored forever)
     const deletedRows = await DeletedUsername.find({}, "username").lean();
     const deletedUsernameSet = new Set(
       deletedRows
@@ -56,94 +64,73 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         .filter(Boolean)
     );
 
-    // ------------------------------------------------------------
-    // ✅ REMOVED: auto-create from LoginSession
-    // (LoginSession should not create new User rows)
-    // ------------------------------------------------------------
-
-    // 2) Usernames from GameEntry (username is REQUIRED, so NO createdBy fallback)
+    // 3) Collect usernames ONLY from GameEntry.username
     const gameUserAgg = await GameEntry.aggregate([
-      {
-        $match: {
-          username: { $ne: null, $ne: "" },
-        },
-      },
-      {
-        $group: {
-          _id: { $trim: { input: "$username" } },
-        },
-      },
+      { $match: { username: { $ne: null, $ne: "" } } },
+      { $group: { _id: { $trim: { input: "$username" } } } },
     ]);
 
     const gameUsernames = gameUserAgg
-      .map((row) => (row._id ? String(row._id).trim() : ""))
+      .map((r) => (r._id ? String(r._id).trim() : ""))
       .filter(Boolean);
 
     const uniqueGameUsernames = [...new Set(gameUsernames)];
 
-    // 3) which game usernames are missing in User collection AND not deleted
+    // 4) Auto-create missing users (virtual users only)
     const missingUsernames = uniqueGameUsernames.filter(
-      (uname) => !realUsernameSet.has(uname) && !deletedUsernameSet.has(uname)
+      (u) => !realUsernameSet.has(u) && !deletedUsernameSet.has(u)
     );
 
-    // 4) auto-create missing users (placeholder) with UNIQUE @noemail.local
-    if (missingUsernames.length > 0) {
-      const docsToInsert = [];
+    if (missingUsernames.length) {
+      const docs = [];
 
       for (const uname of missingUsernames) {
-        const clean = uname.trim();
+        const clean = String(uname).trim();
         if (!clean) continue;
 
         const baseLocal = clean.toLowerCase().replace(/\s+/g, "");
-        let candidate = `${baseLocal}@noemail.local`;
-        let counter = 1;
+        let email = `${baseLocal}@noemail.local`;
+        let i = 1;
 
-        while (existingEmails.has(candidate)) {
-          candidate = `${baseLocal}+${counter}@noemail.local`;
-          counter += 1;
+        while (existingEmails.has(email)) {
+          email = `${baseLocal}+${i}@noemail.local`;
+          i++;
         }
-        existingEmails.add(candidate);
 
-        docsToInsert.push({
+        existingEmails.add(email);
+        realUsernameSet.add(clean);
+
+        docs.push({
           username: clean,
-          email: candidate,
+          email,
           passwordHash: "no-password",
           role: "user",
           isAdmin: false,
           isApproved: false,
           status: "pending",
-          totalPayments: 0,
-          totalFreeplay: 0,
-          totalDeposit: 0,
-          totalRedeem: 0,
         });
       }
 
-      if (docsToInsert.length > 0) {
+      if (docs.length) {
         try {
-          await User.insertMany(docsToInsert, { ordered: false });
-        } catch (insertErr) {
-          console.error("Error auto-creating users from GameEntry:", insertErr);
+          await User.insertMany(docs, { ordered: false });
+        } catch (e) {
+          console.error("Error auto-creating users from GameEntry:", e);
         }
       }
     }
 
-    // 5) Now load users for the RESPONSE (respecting ?status=...)
-    let users = await loadUsersForResponse();
+    // 5) Load users for response
+    const users = await loadUsersForResponse();
     if (!users.length) return res.json([]);
 
-    // 6) username list from filtered users
     const usernames = users
       .map((u) => (u.username ? String(u.username).trim() : ""))
       .filter(Boolean);
 
-    // 7) totals from GameEntry (ONLY username)
+    // 6) Totals (username ONLY)
     const totalsAgg = await GameEntry.aggregate([
-      {
-        $match: {
-          username: { $in: usernames },
-        },
-      },
+      { $match: { username: { $in: usernames } } },
       {
         $group: {
           _id: "$username",
@@ -179,22 +166,17 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     ]);
 
     const totalsByUser = {};
-    for (const row of totalsAgg) {
-      const uname = row._id;
-      totalsByUser[uname] = {
-        totalDeposit: row.totalDeposit || 0,
-        totalRedeem: row.totalRedeem || 0,
-        totalFreeplay: row.totalFreeplay || 0,
+    for (const r of totalsAgg) {
+      totalsByUser[r._id] = {
+        totalDeposit: r.totalDeposit || 0,
+        totalRedeem: r.totalRedeem || 0,
+        totalFreeplay: r.totalFreeplay || 0,
       };
     }
 
-    // 8) latest login sessions (for lastSignIn/Out)
+    // 7) Latest login sessions (match by username only)
     const sessionsAgg = await LoginSession.aggregate([
-      {
-        $match: {
-          username: { $in: usernames },
-        },
-      },
+      { $match: { username: { $in: usernames } } },
       { $sort: { signInAt: -1 } },
       {
         $group: {
@@ -206,255 +188,35 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     ]);
 
     const sessionsByUser = {};
-    for (const row of sessionsAgg) {
-      sessionsByUser[row._id] = {
-        lastSignInAt: row.lastSignInAt || null,
-        lastSignOutAt: row.lastSignOutAt || null,
-      };
+    for (const r of sessionsAgg) {
+      sessionsByUser[r._id] = r;
     }
 
-    // 9) merge into response
+    // 8) Merge
     const enhanced = users.map((u) => {
-      const base = { ...u };
-
       const totals = totalsByUser[u.username] || {
         totalDeposit: 0,
         totalRedeem: 0,
         totalFreeplay: 0,
       };
 
-      base.totalDeposit = totals.totalDeposit;
-      base.totalRedeem = totals.totalRedeem;
-      base.totalFreeplay = totals.totalFreeplay;
-      base.totalPayments = totals.totalRedeem || 0;
-
       const session = sessionsByUser[u.username];
-      let isOnline = false;
+      const isOnline = session?.lastSignInAt && !session?.lastSignOutAt;
 
-      if (session) {
-        const lastSignInAt = session.lastSignInAt || null;
-        const lastSignOutAt = session.lastSignOutAt || null;
-
-        base.lastSignInAt = lastSignInAt || base.lastSignInAt || null;
-        base.lastSignOutAt = lastSignOutAt || base.lastSignOutAt || null;
-
-        if (lastSignInAt && !lastSignOutAt) {
-          isOnline = true;
-        }
-      }
-
-      base.isOnline = isOnline;
-      return base;
+      return {
+        ...u,
+        ...totals,
+        totalPayments: totals.totalRedeem || 0,
+        lastSignInAt: session?.lastSignInAt || null,
+        lastSignOutAt: session?.lastSignOutAt || null,
+        isOnline: Boolean(isOnline),
+      };
     });
 
     return res.json(enhanced);
   } catch (err) {
     console.error("Error fetching users:", err);
     return res.status(500).json({ message: "Failed to fetch users" });
-  }
-});
-
-/**
- * GET /api/admin/users/approved-basic
- *
- * Returns ONLY approved users (status='active' and/or isApproved=true),
- * excludes placeholder emails (@noemail.local),
- * and returns just unique { _id, username, email }.
- */
-router.get("/approved-basic", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const docs = await User.find(
-      {
-        $or: [{ isApproved: true }, { status: "active" }],
-        email: {
-          $ne: null,
-          $not: /@noemail\.local$/i,
-        },
-      },
-      "username email createdAt"
-    )
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const seenEmails = new Set();
-    const result = [];
-
-    for (const u of docs) {
-      const username = u.username ? String(u.username).trim() : "";
-      const email = u.email ? String(u.email).trim() : "";
-
-      if (!username || !email) continue;
-
-      const emailKey = email.toLowerCase();
-      if (seenEmails.has(emailKey)) continue;
-
-      seenEmails.add(emailKey);
-
-      result.push({
-        _id: String(u._id),
-        username,
-        email,
-      });
-    }
-
-    return res.json(result);
-  } catch (err) {
-    console.error("Error fetching approved-basic users:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to fetch approved users (basic)" });
-  }
-});
-
-/**
- * GET /api/admin/users/:username/game-entries
- */
-router.get(
-  "/:username/game-entries",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const username = String(req.params.username || "").trim();
-      if (!username)
-        return res.status(400).json({ message: "username is required" });
-
-      const entries = await GameEntry.find({ username })
-        .sort({ createdAt: -1 })
-        .lean();
-
-      return res.json(entries);
-    } catch (err) {
-      console.error(
-        "Error fetching game entries for admin user:",
-        err.message || err
-      );
-      return res
-        .status(500)
-        .json({ message: "Failed to fetch game entries for user" });
-    }
-  }
-);
-
-/**
- * PATCH /api/admin/users/:id/approve
- * Body (optional): { email: "real@gmail.com" }
- */
-router.patch("/:id/approve", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { email } = req.body || {};
-
-    const update = {
-      isApproved: true,
-      status: "active",
-      lastSignInAt: new Date(),
-    };
-
-    if (email && typeof email === "string" && email.trim()) {
-      update.email = email.trim();
-    }
-
-    const user = await User.findByIdAndUpdate(req.params.id, update, {
-      new: true,
-    });
-
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    await LoginSession.create({
-      username: user.username,
-      email: user.email,
-      signInAt: new Date(),
-      signOutAt: null,
-    });
-
-    res.json(user);
-  } catch (err) {
-    console.error("Error approving user:", err);
-    res.status(500).json({ message: "Failed to approve user" });
-  }
-});
-
-/**
- * PATCH /api/admin/users/:id/block
- */
-router.patch("/:id/block", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const user = await User.findByIdAndUpdate(
-      id,
-      { isApproved: false, status: "blocked" },
-      { new: true }
-    ).select("username email role isAdmin isApproved status createdAt");
-
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    return res.json({
-      message: "User blocked successfully",
-      user,
-    });
-  } catch (err) {
-    console.error("Error blocking user:", err);
-    return res.status(500).json({ message: "Failed to block user" });
-  }
-});
-
-/**
- * DELETE /api/admin/users/:id
- *
- * Supports:
- *  - Real Mongo ObjectId → delete User + sessions + mark username ignored
- *  - "virtual:<username>" → delete sessions + mark username ignored
- */
-router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (id.startsWith("virtual:")) {
-      const username = id.slice("virtual:".length).trim();
-      if (!username)
-        return res.status(400).json({ message: "Invalid virtual user id" });
-
-      await DeletedUsername.updateOne(
-        { username },
-        { $set: { username } },
-        { upsert: true }
-      );
-
-      await LoginSession.deleteMany({ username });
-
-      return res.json({
-        message: `Activity for virtual user "${username}" deleted (username ignored for auto-create).`,
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid user id" });
-    }
-
-    const user = await User.findById(id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    const username = user.username ? String(user.username).trim() : "";
-
-    if (username) {
-      await DeletedUsername.updateOne(
-        { username },
-        { $set: { username } },
-        { upsert: true }
-      );
-
-      await LoginSession.deleteMany({ username });
-    }
-
-    await User.deleteOne({ _id: id });
-
-    return res.json({
-      message: "User deleted and username ignored for auto-create",
-    });
-  } catch (err) {
-    console.error("Error deleting user:", err);
-    return res.status(500).json({ message: "Failed to delete user" });
   }
 });
 
