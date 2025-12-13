@@ -17,6 +17,11 @@ const router = express.Router();
  * ✅ NEVER create users from LoginSession
  * ✅ NEVER use createdBy for usernames/totals
  * ✅ Hide virtual users when ?status=active (so approved list stays clean)
+ *
+ * Fix:
+ * ✅ Prevent duplicate virtual users/emails caused by case/whitespace/punctuation variants
+ *   - Treat usernames as case-insensitive for "missing user" detection
+ *   - More stable email local-part normalization
  */
 router.get("/", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -44,10 +49,14 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     // 1) Load ALL users for dedupe
     const allUsers = await User.find({}, "username email").lean();
 
-    const realUsernameSet = new Set(
-      allUsers
-        .map((u) => (u.username ? String(u.username).trim() : ""))
-        .filter(Boolean)
+    const realUsernames = allUsers
+      .map((u) => (u.username ? String(u.username).trim() : ""))
+      .filter(Boolean);
+
+    // ✅ case-sensitive set (for output) + case-insensitive set (for dedupe)
+    const realUsernameSet = new Set(realUsernames);
+    const realUsernameLowerSet = new Set(
+      realUsernames.map((u) => u.toLowerCase())
     );
 
     const existingEmails = new Set(
@@ -56,11 +65,11 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         .filter(Boolean)
     );
 
-    // 2) Deleted usernames (ignored forever)
+    // 2) Deleted usernames (ignored forever) — treat case-insensitively
     const deletedRows = await DeletedUsername.find({}, "username").lean();
-    const deletedUsernameSet = new Set(
+    const deletedUsernameLowerSet = new Set(
       deletedRows
-        .map((d) => (d.username ? String(d.username).trim() : ""))
+        .map((d) => (d.username ? String(d.username).trim().toLowerCase() : ""))
         .filter(Boolean)
     );
 
@@ -77,9 +86,13 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     const uniqueGameUsernames = [...new Set(gameUsernames)];
 
     // 4) Auto-create missing users (virtual users only)
-    const missingUsernames = uniqueGameUsernames.filter(
-      (u) => !realUsernameSet.has(u) && !deletedUsernameSet.has(u)
-    );
+    // ✅ Fix: case-insensitive missing detection (prevents duplicates like "Prasis" vs "prasis")
+    const missingUsernames = uniqueGameUsernames.filter((u) => {
+      const key = String(u).trim().toLowerCase();
+      return (
+        !realUsernameLowerSet.has(key) && !deletedUsernameLowerSet.has(key)
+      );
+    });
 
     if (missingUsernames.length) {
       const docs = [];
@@ -88,7 +101,15 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         const clean = String(uname).trim();
         if (!clean) continue;
 
-        const baseLocal = clean.toLowerCase().replace(/\s+/g, "");
+        // ✅ stable email local-part normalization to reduce collisions
+        const baseLocal = clean
+          .toLowerCase()
+          .trim()
+          .replace(/\s+/g, "")
+          .replace(/[^a-z0-9]/g, "");
+
+        if (!baseLocal) continue;
+
         let email = `${baseLocal}@noemail.local`;
         let i = 1;
 
@@ -98,7 +119,10 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
         }
 
         existingEmails.add(email);
+
+        // add to both sets so next iterations won't create dupes
         realUsernameSet.add(clean);
+        realUsernameLowerSet.add(clean.toLowerCase());
 
         docs.push({
           username: clean,
