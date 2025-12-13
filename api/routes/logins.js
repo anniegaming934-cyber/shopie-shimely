@@ -1,4 +1,5 @@
 // api/routes/logins.js
+import mongoose from "mongoose";
 import express from "express";
 import { connectDB } from "../config/db.js";
 import LoginSession from "../models/LoginSession.js";
