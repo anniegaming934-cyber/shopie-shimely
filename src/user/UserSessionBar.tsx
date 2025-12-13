@@ -191,6 +191,7 @@ const UserSessionBar: React.FC<UserSessionBarProps> = ({
       if (sid && isValidObjectId(sid)) {
         await apiClient.post(`${LOGIN_API_BASE}/end`, {
           sessionId: sid,
+          email: displayEmail || email || localStorage.getItem("userEmail"),
           signOutAt: new Date().toISOString(),
         });
       } else {
@@ -334,7 +335,7 @@ const UserSessionBar: React.FC<UserSessionBarProps> = ({
       </div>
 
       {/* LOGOUT CONFIRM MODAL */}
-      {/* {showConfirmLogout && (
+      {showConfirmLogout && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm">
           <div className="bg-white w-full max-w-sm mx-4 rounded-2xl shadow-xl border border-slate-200 p-5">
             <h2 className="text-sm font-semibold text-slate-900 mb-1">
@@ -373,7 +374,7 @@ const UserSessionBar: React.FC<UserSessionBarProps> = ({
             </div>
           </div>
         </div>
-      )} */}
+      )}
     </>
   );
 };

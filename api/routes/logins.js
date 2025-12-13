@@ -124,33 +124,49 @@ router.post("/start", async (req, res) => {
  * 🔴 POST /api/logins/end
  * Body: { sessionId, signOutAt? }
  */
+
 router.post("/end", async (req, res) => {
   try {
-    const { sessionId, signOutAt } = req.body;
+    const { sessionId, email, signOutAt } = req.body;
+    const outAt = signOutAt ? new Date(signOutAt) : new Date();
 
-    if (!sessionId || typeof sessionId !== "string") {
-      return res.status(400).json({ message: "sessionId is required" });
+    let session = null;
+
+    // 1️⃣ Try by sessionId first
+    if (sessionId && typeof sessionId === "string") {
+      if (mongoose.Types.ObjectId.isValid(sessionId)) {
+        session = await LoginSession.findById(sessionId);
+        if (session) {
+          session.signOutAt = outAt;
+          await session.save();
+          return res.json(formatSession(session));
+        }
+      }
     }
 
-    // ✅ prevent CastError -> 500
-    if (!mongoose.Types.ObjectId.isValid(sessionId)) {
-      return res.status(400).json({ message: "Invalid sessionId" });
+    // 2️⃣ Fallback: close latest open session by email
+    if (email && typeof email === "string") {
+      session = await LoginSession.findOneAndUpdate(
+        { email: email.trim(), signOutAt: null },
+        { $set: { signOutAt: outAt } },
+        { new: true, sort: { signInAt: -1 } }
+      );
+
+      if (session) {
+        return res.json(formatSession(session));
+      }
     }
 
-    const session = await LoginSession.findById(sessionId);
-    if (!session) {
-      return res.status(404).json({ message: "Session not found" });
-    }
-
-    session.signOutAt = signOutAt ? new Date(signOutAt) : new Date();
-    await session.save();
-
-    return res.json(formatSession(session));
+    // 3️⃣ Nothing to close
+    return res.status(404).json({
+      message: "No active session found to close",
+    });
   } catch (err) {
     console.error("Error in POST /api/logins/end:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to end session", error: err.message });
+    return res.status(500).json({
+      message: "Failed to end session",
+      error: err.message,
+    });
   }
 });
 
