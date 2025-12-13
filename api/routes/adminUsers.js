@@ -219,5 +219,94 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     return res.status(500).json({ message: "Failed to fetch users" });
   }
 });
+// ✅ APPROVE USER
+// PATCH /api/admin/users/:id/approve
+router.patch("/:id/approve", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Support "virtual:<username>" too
+    if (id.startsWith("virtual:")) {
+      const username = id.slice("virtual:".length).trim();
+      if (!username)
+        return res.status(400).json({ message: "Invalid virtual id" });
+
+      const user = await User.findOneAndUpdate(
+        { username },
+        { $set: { isApproved: true, status: "active" } },
+        { new: true }
+      ).lean();
+
+      if (!user) return res.status(404).json({ message: "User not found" });
+      return res.json({ message: "User approved", user });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      id,
+      { $set: { isApproved: true, status: "active" } },
+      { new: true }
+    ).lean();
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ message: "User approved", user });
+  } catch (err) {
+    console.error("Approve user error:", err);
+    return res.status(500).json({ message: "Failed to approve user" });
+  }
+});
+
+// ✅ DELETE USER
+// DELETE /api/admin/users/:id
+router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // "virtual:<username>" delete
+    if (id.startsWith("virtual:")) {
+      const username = id.slice("virtual:".length).trim();
+      if (!username)
+        return res.status(400).json({ message: "Invalid virtual id" });
+
+      // prevent re-auto-create from GameEntry usernames
+      await DeletedUsername.updateOne(
+        { username },
+        { $set: { username } },
+        { upsert: true }
+      );
+
+      await LoginSession.deleteMany({ username });
+      await GameEntry.deleteMany({ username });
+      await User.deleteOne({ username });
+
+      return res.json({
+        message: `Deleted virtual user "${username}" (and related data).`,
+      });
+    }
+
+    // normal delete (real User document)
+    const user = await User.findById(id).lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const username = user.username ? String(user.username).trim() : "";
+
+    if (username) {
+      await DeletedUsername.updateOne(
+        { username },
+        { $set: { username } },
+        { upsert: true }
+      );
+
+      await LoginSession.deleteMany({ username });
+      await GameEntry.deleteMany({ username });
+    }
+
+    await User.deleteOne({ _id: id });
+
+    return res.json({ message: "User deleted" });
+  } catch (err) {
+    console.error("Delete user error:", err);
+    return res.status(500).json({ message: "Failed to delete user" });
+  }
+});
 
 export default router;
